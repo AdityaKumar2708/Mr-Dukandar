@@ -176,6 +176,19 @@
           <input id="bill-customer-name" placeholder="Customer Name (Optional)" />
           <input id="bill-customer-contact" placeholder="Contact Number (Optional)" />
         </form>
+        <div class="billing-summary">
+          <div class="billing-summary-card">
+            <div class="billing-summary-label">Selected Items</div>
+            <div id="bill-items-count" class="billing-summary-value">0</div>
+          </div>
+          <div class="billing-summary-card">
+            <div class="billing-summary-label">Ready to Bill</div>
+            <div id="bill-ready-text" class="billing-summary-value">Add quantities from the stock list</div>
+          </div>
+          <div class="billing-summary-card billing-summary-actions">
+            <button id="clear-bill-btn" type="button" class="btn-secondary">Clear Bill</button>
+          </div>
+        </div>
         <table>
           <thead>
             <tr>
@@ -184,6 +197,7 @@
               <th>Price</th>
               <th>Bill Qty</th>
               <th>Line Total</th>
+              <th>Quick Add</th>
             </tr>
           </thead>
           <tbody id="billing-item-table"></tbody>

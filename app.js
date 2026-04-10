@@ -265,6 +265,54 @@ function getLowStockProducts(products) {
   return products.filter(product => Number(product.quantity || 0) <= Number(product.minimumQuantity || 0));
 }
 
+function getReorderQuantity(product) {
+  const minimum = Number(product.minimumQuantity || 0);
+  const quantity = Number(product.quantity || 0);
+  return Math.max(minimum - quantity, 1);
+}
+
+async function syncLowStockReorders() {
+  requireUser();
+
+  const lowStockProducts = getLowStockProducts(state.products);
+  const lowStockIds = new Set(lowStockProducts.map(product => product.id));
+  const reorderSnap = await getDocs(userCollection('reorders'));
+  const existingReorders = reorderSnap.docs.map(item => ({ id: item.id, ...item.data() }));
+
+  const autoReorders = existingReorders.filter(item => item.source === 'auto' && item.productId);
+  const autoByProductId = new Map(autoReorders.map(item => [item.productId, item]));
+
+  for (const product of lowStockProducts) {
+    const payload = {
+      productId: product.id,
+      itemName: product.name,
+      imageUrl: product.imageUrl || null,
+      cost: Number(product.cost || 0),
+      quantity: getReorderQuantity(product),
+      source: 'auto',
+      updatedAt: new Date().toISOString()
+    };
+
+    const existing = autoByProductId.get(product.id);
+    if (existing) {
+      await updateDoc(userDoc('reorders', existing.id), payload);
+    } else {
+      await addDoc(userCollection('reorders'), {
+        ...payload,
+        createdAt: new Date().toISOString()
+      });
+    }
+  }
+
+  for (const item of autoReorders) {
+    if (!lowStockIds.has(item.productId)) {
+      await deleteDoc(userDoc('reorders', item.id));
+    }
+  }
+
+  await refreshReorders();
+}
+
 function renderWidgetList(el, rows) {
   el.innerHTML = '';
   if (!rows.length) {
@@ -490,6 +538,73 @@ function renderBillingSellers() {
   });
 }
 
+function getBillingSelectedCount() {
+  return Object.values(state.billingQuantities).reduce((sum, qty) => sum + (Number(qty || 0) > 0 ? 1 : 0), 0);
+}
+
+function updateBillingSummary() {
+  const selectedCount = getBillingSelectedCount();
+  const total = Object.entries(state.billingQuantities).reduce((sum, [productId, qty]) => {
+    const product = state.products.find(item => item.id === productId);
+    return sum + Number(qty || 0) * Number(product?.price || 0);
+  }, 0);
+
+  const itemsCountEl = document.getElementById('bill-items-count');
+  const readyTextEl = document.getElementById('bill-ready-text');
+
+  if (itemsCountEl) {
+    itemsCountEl.textContent = String(selectedCount);
+  }
+
+  if (readyTextEl) {
+    readyTextEl.textContent = selectedCount
+      ? `${formatMoney(total)} across ${selectedCount} item${selectedCount === 1 ? '' : 's'}`
+      : 'Add quantities from the stock list';
+  }
+}
+
+function updateBillingRow(productId) {
+  const product = state.products.find(item => item.id === productId);
+  if (!product) return;
+
+  const row = document.querySelector(`tr[data-product-id="${cssEscape(productId)}"]`);
+  if (!row) return;
+
+  const qtyInput = row.querySelector('.bill-qty-input');
+  const raw = Number(qtyInput?.value || 0);
+  const clamped = Math.max(0, Math.min(raw, Number(product.quantity || 0)));
+  state.billingQuantities[productId] = clamped;
+
+  if (qtyInput) {
+    qtyInput.value = clamped;
+  }
+
+  const lineTotalEl = row.querySelector('.bill-line-total');
+  if (lineTotalEl) {
+    lineTotalEl.textContent = formatMoney(clamped * Number(product.price || 0));
+  }
+
+  updateBillTotalPreview();
+  updateBillingSummary();
+}
+
+function adjustBillingQuantity(productId, delta) {
+  const product = state.products.find(item => item.id === productId);
+  if (!product) return;
+  const nextQty = Math.max(0, Math.min(Number(state.billingQuantities[productId] || 0) + delta, Number(product.quantity || 0)));
+  state.billingQuantities[productId] = nextQty;
+  updateBillingRow(productId);
+}
+
+function clearBillDraft() {
+  state.billingQuantities = {};
+  document.getElementById('bill-customer-name').value = '';
+  document.getElementById('bill-customer-contact').value = '';
+  renderBillingItems();
+  updateBillTotalPreview();
+  updateBillingSummary();
+}
+
 function renderBillingItems() {
   const tbody = document.getElementById('billing-item-table');
   const queryText = state.billingSearchQuery.trim().toLowerCase();
@@ -500,37 +615,57 @@ function renderBillingItems() {
 
   tbody.innerHTML = '';
   if (!filtered.length) {
-    tbody.innerHTML = '<tr><td colspan="5">No items in stock. Add stocks first.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6">No items in stock. Add stocks first.</td></tr>';
     updateBillTotalPreview();
+    updateBillingSummary();
     return;
   }
 
   filtered.forEach(product => {
     const qty = Number(state.billingQuantities[product.id] || 0);
     const tr = document.createElement('tr');
+    tr.dataset.productId = product.id;
     tr.innerHTML = `
       <td>${esc(product.name)}</td>
       <td>${esc(product.quantity)}</td>
       <td>${Number(product.price || 0).toFixed(2)}</td>
       <td><input class="bill-qty-input" type="number" min="0" max="${Number(product.quantity || 0)}" data-product-id="${product.id}" value="${qty}" /></td>
-      <td>${formatMoney(qty * Number(product.price || 0))}</td>`;
+      <td class="bill-line-total">${formatMoney(qty * Number(product.price || 0))}</td>
+      <td>
+        <div class="bill-qty-controls">
+          <button type="button" class="bill-minus btn-secondary" data-product-id="${product.id}">-</button>
+          <button type="button" class="bill-plus btn-secondary" data-product-id="${product.id}">+</button>
+          <button type="button" class="bill-clear btn-danger" data-product-id="${product.id}">x</button>
+        </div>
+      </td>`;
     tbody.appendChild(tr);
   });
 
   tbody.querySelectorAll('.bill-qty-input').forEach(input => {
     input.addEventListener('input', e => {
       const productId = e.target.dataset.productId;
-      const product = state.products.find(item => item.id === productId);
-      const raw = Number(e.target.value || 0);
-      const clamped = Math.max(0, Math.min(raw, Number(product?.quantity || 0)));
-      state.billingQuantities[productId] = clamped;
-      e.target.value = clamped;
-      updateBillTotalPreview();
-      renderBillingItems();
+      state.billingQuantities[productId] = Number(e.target.value || 0);
+      updateBillingRow(productId);
+    });
+  });
+
+  tbody.querySelectorAll('.bill-plus').forEach(btn => {
+    btn.addEventListener('click', () => adjustBillingQuantity(btn.dataset.productId, 1));
+  });
+
+  tbody.querySelectorAll('.bill-minus').forEach(btn => {
+    btn.addEventListener('click', () => adjustBillingQuantity(btn.dataset.productId, -1));
+  });
+
+  tbody.querySelectorAll('.bill-clear').forEach(btn => {
+    btn.addEventListener('click', () => {
+      state.billingQuantities[btn.dataset.productId] = 0;
+      updateBillingRow(btn.dataset.productId);
     });
   });
 
   updateBillTotalPreview();
+  updateBillingSummary();
 }
 
 function updateBillTotalPreview() {
@@ -1025,13 +1160,10 @@ async function createBill(action) {
     });
   });
 
-  state.billingQuantities = {};
-  document.getElementById('bill-customer-name').value = '';
-  document.getElementById('bill-customer-contact').value = '';
-
   await refreshProducts();
   await refreshInvoices();
   await refreshSummary();
+  clearBillDraft();
 
   const invoice = { id: invoiceId, ...invoicePayload };
   if (action === 'pdf') openPrintableBill(invoice);
@@ -1077,7 +1209,8 @@ async function saveReorder() {
     itemName: document.getElementById('reorder-item-name').value.trim(),
     imageUrl: document.getElementById('reorder-item-image').value.trim() || null,
     cost: Number(document.getElementById('reorder-item-cost').value || 0),
-    quantity: Number(document.getElementById('reorder-item-qty').value || 0)
+    quantity: Number(document.getElementById('reorder-item-qty').value || 0),
+    source: 'manual'
   };
 
   if (!payload.itemName) {
@@ -1343,6 +1476,7 @@ async function refreshProducts() {
   renderProducts();
   renderBillingItems();
   renderDashboard();
+  await syncLowStockReorders();
 }
 
 async function refreshReorders() {
@@ -1547,6 +1681,10 @@ function wireAppHandlers() {
   document.getElementById('billing-search').addEventListener('keyup', e => {
     state.billingSearchQuery = e.target.value;
     renderBillingItems();
+  });
+
+  document.getElementById('clear-bill-btn').addEventListener('click', () => {
+    clearBillDraft();
   });
 
   document.getElementById('invoice-search').addEventListener('keyup', e => {
